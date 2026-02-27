@@ -4,15 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-  afterEach,
-  type Mock,
-} from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { createPolicyUpdater, ALWAYS_ALLOW_PRIORITY } from './config.js';
@@ -61,8 +53,8 @@ describe('createPolicyUpdater', () => {
     const userPoliciesDir = '/mock/user/.gemini/policies';
     const policyFile = path.join(userPoliciesDir, AUTO_SAVED_POLICY_FILENAME);
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    (fs.mkdir as unknown as Mock).mockResolvedValue(undefined);
-    (fs.readFile as unknown as Mock).mockRejectedValue(
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
+    vi.mocked(fs.readFile).mockRejectedValue(
       makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
     ); // Simulate new file
 
@@ -70,8 +62,8 @@ describe('createPolicyUpdater', () => {
       writeFile: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
     };
-    (fs.open as unknown as Mock).mockResolvedValue(mockFileHandle);
-    (fs.rename as unknown as Mock).mockResolvedValue(undefined);
+    vi.mocked(fs.open).mockResolvedValue(mockFileHandle);
+    vi.mocked(fs.rename).mockResolvedValue(undefined);
 
     const toolName = 'test_tool';
     await messageBus.publish({
@@ -81,24 +73,36 @@ describe('createPolicyUpdater', () => {
     });
 
     // Wait for async operations (microtasks)
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => {
+      expect(mockStorage.getWorkspacePoliciesDir).toHaveBeenCalled();
+      expect(fs.mkdir).toHaveBeenCalledWith(workspacePoliciesDir, {
+        recursive: true,
+      });
 
-    expect(fs.mkdir).toHaveBeenCalledWith(userPoliciesDir, {
-      recursive: true,
+      await vi.waitFor(() => {
+        expect(fs.mkdir).toHaveBeenCalledWith(userPoliciesDir, {
+          recursive: true,
+        });
+
+        expect(fs.open).toHaveBeenCalledWith(
+          expect.stringMatching(/\.tmp$/),
+          'wx',
+        );
+
+        // Check written content
+        const expectedContent = expect.stringContaining(
+          `toolName = "test_tool"`,
+        );
+        expect(mockFileHandle.writeFile).toHaveBeenCalledWith(
+          expectedContent,
+          'utf-8',
+        );
+        expect(fs.rename).toHaveBeenCalledWith(
+          expect.stringMatching(/\.tmp$/),
+          policyFile,
+        );
+      });
     });
-
-    expect(fs.open).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/), 'wx');
-
-    // Check written content
-    const expectedContent = expect.stringContaining(`toolName = "test_tool"`);
-    expect(mockFileHandle.writeFile).toHaveBeenCalledWith(
-      expectedContent,
-      'utf-8',
-    );
-    expect(fs.rename).toHaveBeenCalledWith(
-      expect.stringMatching(/\.tmp$/),
-      policyFile,
-    );
   });
 
   it('should not persist policy when persist flag is false or undefined', async () => {
@@ -109,10 +113,10 @@ describe('createPolicyUpdater', () => {
       toolName: 'test_tool',
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(fs.writeFile).not.toHaveBeenCalled();
-    expect(fs.rename).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(fs.writeFile).not.toHaveBeenCalled();
+      expect(fs.rename).not.toHaveBeenCalled();
+    });
   });
 
   it('should persist policy with commandPrefix when provided', async () => {
@@ -121,8 +125,8 @@ describe('createPolicyUpdater', () => {
     const userPoliciesDir = '/mock/user/.gemini/policies';
     const policyFile = path.join(userPoliciesDir, AUTO_SAVED_POLICY_FILENAME);
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    (fs.mkdir as unknown as Mock).mockResolvedValue(undefined);
-    (fs.readFile as unknown as Mock).mockRejectedValue(
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
+    vi.mocked(fs.readFile).mockRejectedValue(
       makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
     );
 
@@ -130,8 +134,8 @@ describe('createPolicyUpdater', () => {
       writeFile: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
     };
-    (fs.open as unknown as Mock).mockResolvedValue(mockFileHandle);
-    (fs.rename as unknown as Mock).mockResolvedValue(undefined);
+    vi.mocked(fs.open).mockResolvedValue(mockFileHandle);
+    vi.mocked(fs.rename).mockResolvedValue(undefined);
 
     const toolName = 'run_shell_command';
     const commandPrefix = 'git status';
@@ -143,23 +147,26 @@ describe('createPolicyUpdater', () => {
       commandPrefix,
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => {
+      // In-memory rule check (unchanged)
+      const rules = policyEngine.getRules();
+      const addedRule = rules.find((r) => r.toolName === toolName);
+      expect(addedRule).toBeDefined();
+      expect(addedRule?.priority).toBe(ALWAYS_ALLOW_PRIORITY);
+      expect(addedRule?.argsPattern).toEqual(
+        new RegExp(`"command":"git\\ status(?:[\\s"]|\\\\")`),
+      );
 
-    // In-memory rule check (unchanged)
-    const rules = policyEngine.getRules();
-    const addedRule = rules.find((r) => r.toolName === toolName);
-    expect(addedRule).toBeDefined();
-    expect(addedRule?.priority).toBe(ALWAYS_ALLOW_PRIORITY);
-    expect(addedRule?.argsPattern).toEqual(
-      new RegExp(`"command":"git\\ status(?:[\\s"]|\\\\")`),
-    );
-
-    // Verify file written
-    expect(fs.open).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/), 'wx');
-    expect(mockFileHandle.writeFile).toHaveBeenCalledWith(
-      expect.stringContaining(`commandPrefix = "git status"`),
-      'utf-8',
-    );
+      // Verify file written
+      expect(fs.open).toHaveBeenCalledWith(
+        expect.stringMatching(/\.tmp$/),
+        'wx',
+      );
+      expect(mockFileHandle.writeFile).toHaveBeenCalledWith(
+        expect.stringContaining(`commandPrefix = "git status"`),
+        'utf-8',
+      );
+    });
   });
 
   it('should persist policy with mcpName and toolName when provided', async () => {
@@ -168,8 +175,8 @@ describe('createPolicyUpdater', () => {
     const userPoliciesDir = '/mock/user/.gemini/policies';
     const policyFile = path.join(userPoliciesDir, AUTO_SAVED_POLICY_FILENAME);
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    (fs.mkdir as unknown as Mock).mockResolvedValue(undefined);
-    (fs.readFile as unknown as Mock).mockRejectedValue(
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
+    vi.mocked(fs.readFile).mockRejectedValue(
       makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
     );
 
@@ -177,8 +184,8 @@ describe('createPolicyUpdater', () => {
       writeFile: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
     };
-    (fs.open as unknown as Mock).mockResolvedValue(mockFileHandle);
-    (fs.rename as unknown as Mock).mockResolvedValue(undefined);
+    vi.mocked(fs.open).mockResolvedValue(mockFileHandle);
+    vi.mocked(fs.rename).mockResolvedValue(undefined);
 
     const mcpName = 'my-jira-server';
     const simpleToolName = 'search';
@@ -191,15 +198,18 @@ describe('createPolicyUpdater', () => {
       mcpName,
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    // Verify file written
-    expect(fs.open).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/), 'wx');
-    const writeCall = mockFileHandle.writeFile.mock.calls[0];
-    const writtenContent = writeCall[0] as string;
-    expect(writtenContent).toContain(`mcpName = "${mcpName}"`);
-    expect(writtenContent).toContain(`toolName = "${simpleToolName}"`);
-    expect(writtenContent).toContain('priority = 200');
+    await vi.waitFor(() => {
+      // Verify file written
+      expect(fs.open).toHaveBeenCalledWith(
+        expect.stringMatching(/\.tmp$/),
+        'wx',
+      );
+      const writeCall = mockFileHandle.writeFile.mock.calls[0];
+      const writtenContent = writeCall[0] as string;
+      expect(writtenContent).toContain(`mcpName = "${mcpName}"`);
+      expect(writtenContent).toContain(`toolName = "${simpleToolName}"`);
+      expect(writtenContent).toContain('priority = 200');
+    });
   });
 
   it('should escape special characters in toolName and mcpName', async () => {
@@ -208,8 +218,8 @@ describe('createPolicyUpdater', () => {
     const userPoliciesDir = '/mock/user/.gemini/policies';
     const policyFile = path.join(userPoliciesDir, AUTO_SAVED_POLICY_FILENAME);
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    (fs.mkdir as unknown as Mock).mockResolvedValue(undefined);
-    (fs.readFile as unknown as Mock).mockRejectedValue(
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
+    vi.mocked(fs.readFile).mockRejectedValue(
       makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
     );
 
@@ -217,8 +227,8 @@ describe('createPolicyUpdater', () => {
       writeFile: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
     };
-    (fs.open as unknown as Mock).mockResolvedValue(mockFileHandle);
-    (fs.rename as unknown as Mock).mockResolvedValue(undefined);
+    vi.mocked(fs.open).mockResolvedValue(mockFileHandle);
+    vi.mocked(fs.rename).mockResolvedValue(undefined);
 
     const mcpName = 'my"jira"server';
     const toolName = `my"jira"server__search"tool"`;
@@ -230,26 +240,29 @@ describe('createPolicyUpdater', () => {
       mcpName,
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => {
+      expect(fs.open).toHaveBeenCalledWith(
+        expect.stringMatching(/\.tmp$/),
+        'wx',
+      );
+      const writeCall = mockFileHandle.writeFile.mock.calls[0];
+      const writtenContent = writeCall[0] as string;
 
-    expect(fs.open).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/), 'wx');
-    const writeCall = mockFileHandle.writeFile.mock.calls[0];
-    const writtenContent = writeCall[0] as string;
+      // Verify escaping - should be valid TOML
+      // Note: @iarna/toml optimizes for shortest representation, so it may use single quotes 'foo"bar'
+      // instead of "foo\"bar\"" if there are no single quotes in the string.
+      try {
+        expect(writtenContent).toContain(`mcpName = "my\\"jira\\"server"`);
+      } catch {
+        expect(writtenContent).toContain(`mcpName = 'my"jira"server'`);
+      }
 
-    // Verify escaping - should be valid TOML
-    // Note: @iarna/toml optimizes for shortest representation, so it may use single quotes 'foo"bar'
-    // instead of "foo\"bar\"" if there are no single quotes in the string.
-    try {
-      expect(writtenContent).toContain(`mcpName = "my\\"jira\\"server"`);
-    } catch {
-      expect(writtenContent).toContain(`mcpName = 'my"jira"server'`);
-    }
-
-    try {
-      expect(writtenContent).toContain(`toolName = "search\\"tool\\""`);
-    } catch {
-      expect(writtenContent).toContain(`toolName = 'search"tool"'`);
-    }
+      try {
+        expect(writtenContent).toContain(`toolName = "search\\"tool\\""`);
+      } catch {
+        expect(writtenContent).toContain(`toolName = 'search"tool"'`);
+      }
+    });
   });
 
   it('should include error details in feedback message on persistence failure', async () => {
@@ -264,9 +277,7 @@ describe('createPolicyUpdater', () => {
       workspacePoliciesDir,
     );
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    (fs.mkdir as unknown as Mock).mockRejectedValue(
-      new Error('Permission denied'),
-    );
+    vi.mocked(fs.mkdir).mockRejectedValue(new Error('Permission denied'));
 
     const feedbackSpy = vi.spyOn(coreEvents, 'emitFeedback');
 
@@ -276,13 +287,13 @@ describe('createPolicyUpdater', () => {
       persist: true,
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    expect(feedbackSpy).toHaveBeenCalledWith(
-      'error',
-      expect.stringContaining('Permission denied'),
-      expect.any(Error),
-    );
+    await vi.waitFor(() => {
+      expect(feedbackSpy).toHaveBeenCalledWith(
+        'error',
+        expect.stringContaining('Permission denied'),
+        expect.any(Error),
+      );
+    });
   });
 
   it('should clean up tmp file on write failure', async () => {
@@ -297,8 +308,8 @@ describe('createPolicyUpdater', () => {
       workspacePoliciesDir,
     );
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    (fs.mkdir as unknown as Mock).mockResolvedValue(undefined);
-    (fs.readFile as unknown as Mock).mockRejectedValue(
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
+    vi.mocked(fs.readFile).mockRejectedValue(
       makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
     );
 
@@ -306,8 +317,8 @@ describe('createPolicyUpdater', () => {
       writeFile: vi.fn().mockRejectedValue(new Error('Disk full')),
       close: vi.fn().mockResolvedValue(undefined),
     };
-    (fs.open as unknown as Mock).mockResolvedValue(mockFileHandle);
-    (fs.unlink as unknown as Mock).mockResolvedValue(undefined);
+    vi.mocked(fs.open).mockResolvedValue(mockFileHandle);
+    vi.mocked(fs.unlink).mockResolvedValue(undefined);
 
     await messageBus.publish({
       type: MessageBusType.UPDATE_POLICY,
@@ -315,10 +326,10 @@ describe('createPolicyUpdater', () => {
       persist: true,
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    // Should attempt to clean up the tmp file
-    expect(fs.unlink).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/));
+    await vi.waitFor(() => {
+      // Should attempt to clean up the tmp file
+      expect(fs.unlink).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/));
+    });
   });
 
   it('should abort persistence on non-ENOENT read errors', async () => {
@@ -333,9 +344,9 @@ describe('createPolicyUpdater', () => {
       workspacePoliciesDir,
     );
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    (fs.mkdir as unknown as Mock).mockResolvedValue(undefined);
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
     // Simulate EACCES when reading the existing policy file
-    (fs.readFile as unknown as Mock).mockRejectedValue(
+    vi.mocked(fs.readFile).mockRejectedValue(
       makeNodeError('Permission denied', 'EACCES'),
     );
 
@@ -347,16 +358,16 @@ describe('createPolicyUpdater', () => {
       persist: true,
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    // Should NOT attempt to write a new file
-    expect(fs.open).not.toHaveBeenCalled();
-    // Should report the error with details
-    expect(feedbackSpy).toHaveBeenCalledWith(
-      'error',
-      expect.stringContaining('Permission denied'),
-      expect.any(Error),
-    );
+    await vi.waitFor(() => {
+      // Should NOT attempt to write a new file
+      expect(fs.open).not.toHaveBeenCalled();
+      // Should report the error with details
+      expect(feedbackSpy).toHaveBeenCalledWith(
+        'error',
+        expect.stringContaining('Permission denied'),
+        expect.any(Error),
+      );
+    });
   });
 
   it('should fall back to copy+unlink when rename fails with EXDEV', async () => {
@@ -371,8 +382,8 @@ describe('createPolicyUpdater', () => {
       workspacePoliciesDir,
     );
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    (fs.mkdir as unknown as Mock).mockResolvedValue(undefined);
-    (fs.readFile as unknown as Mock).mockRejectedValue(
+    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
+    vi.mocked(fs.readFile).mockRejectedValue(
       makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
     );
 
@@ -380,13 +391,13 @@ describe('createPolicyUpdater', () => {
       writeFile: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
     };
-    (fs.open as unknown as Mock).mockResolvedValue(mockFileHandle);
+    vi.mocked(fs.open).mockResolvedValue(mockFileHandle);
     // Simulate cross-device link error
-    (fs.rename as unknown as Mock).mockRejectedValue(
+    vi.mocked(fs.rename).mockRejectedValue(
       makeNodeError('EXDEV: cross-device link not permitted', 'EXDEV'),
     );
-    (fs.copyFile as unknown as Mock).mockResolvedValue(undefined);
-    (fs.unlink as unknown as Mock).mockResolvedValue(undefined);
+    vi.mocked(fs.copyFile).mockResolvedValue(undefined);
+    vi.mocked(fs.unlink).mockResolvedValue(undefined);
 
     await messageBus.publish({
       type: MessageBusType.UPDATE_POLICY,
@@ -394,13 +405,13 @@ describe('createPolicyUpdater', () => {
       persist: true,
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
-    // Should fall back to copy + unlink
-    expect(fs.copyFile).toHaveBeenCalledWith(
-      expect.stringMatching(/\.tmp$/),
-      policyFile,
-    );
-    expect(fs.unlink).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/));
+    await vi.waitFor(() => {
+      // Should fall back to copy + unlink
+      expect(fs.copyFile).toHaveBeenCalledWith(
+        expect.stringMatching(/\.tmp$/),
+        policyFile,
+      );
+      expect(fs.unlink).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/));
+    });
   });
 });
