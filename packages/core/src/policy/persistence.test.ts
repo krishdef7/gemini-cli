@@ -76,34 +76,24 @@ describe('createPolicyUpdater', () => {
 
     // Wait for async operations (microtasks)
     await vi.waitFor(() => {
-      expect(mockStorage.getWorkspacePoliciesDir).toHaveBeenCalled();
-      expect(fs.mkdir).toHaveBeenCalledWith(workspacePoliciesDir, {
+      expect(fs.mkdir).toHaveBeenCalledWith(userPoliciesDir, {
         recursive: true,
       });
 
-      await vi.waitFor(() => {
-        expect(fs.mkdir).toHaveBeenCalledWith(userPoliciesDir, {
-          recursive: true,
-        });
+      expect(fs.open).toHaveBeenCalledWith(
+        expect.stringMatching(/\.tmp$/),
+        'wx',
+      );
 
-        expect(fs.open).toHaveBeenCalledWith(
-          expect.stringMatching(/\.tmp$/),
-          'wx',
-        );
-
-        // Check written content
-        const expectedContent = expect.stringContaining(
-          `toolName = "test_tool"`,
-        );
-        expect(mockFileHandle.writeFile).toHaveBeenCalledWith(
-          expectedContent,
-          'utf-8',
-        );
-        expect(fs.rename).toHaveBeenCalledWith(
-          expect.stringMatching(/\.tmp$/),
-          policyFile,
-        );
-      });
+      const expectedContent = expect.stringContaining(`toolName = "test_tool"`);
+      expect(mockFileHandle.writeFile).toHaveBeenCalledWith(
+        expectedContent,
+        'utf-8',
+      );
+      expect(fs.rename).toHaveBeenCalledWith(
+        expect.stringMatching(/\.tmp$/),
+        policyFile,
+      );
     });
   });
 
