@@ -76,7 +76,7 @@ describe('createPolicyUpdater', () => {
 
     // Wait for async operations (microtasks)
     await vi.waitFor(() => {
-      expect(fs.mkdir).toHaveBeenCalledWith(userPoliciesDir, {
+      expect(fs.mkdir).toHaveBeenCalledWith(path.dirname(policyFile), {
         recursive: true,
       });
 
