@@ -737,6 +737,7 @@ export async function loadCliConfig(
     geminiMdFileCount: fileCount,
     geminiMdFilePaths: filePaths,
     approvalMode,
+    approvalModeExplicit: !!(argv.approvalMode || argv.yolo),
     disableYoloMode:
       settings.security?.disableYoloMode || settings.admin?.secureModeEnabled,
     showMemoryUsage: settings.ui?.showMemoryUsage || false,
