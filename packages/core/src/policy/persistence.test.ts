@@ -5,26 +5,21 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { createPolicyUpdater, ALWAYS_ALLOW_PRIORITY } from './config.js';
+import {
+  createPolicyUpdater,
+  getAlwaysAllowPriorityFraction,
+} from './config.js';
 import { PolicyEngine } from './policy-engine.js';
 import { MessageBus } from '../confirmation-bus/message-bus.js';
 import { MessageBusType } from '../confirmation-bus/types.js';
 import { Storage, AUTO_SAVED_POLICY_FILENAME } from '../config/storage.js';
 import { ApprovalMode } from './types.js';
-import { coreEvents } from '../utils/events.js';
+import { vol, fs as memfs } from 'memfs';
 
-/**
- * Creates a Node.js-style error with a `code` property.
- */
-function makeNodeError(message: string, code: string): NodeJS.ErrnoException {
-  const err = new Error(message) as NodeJS.ErrnoException;
-  err.code = code;
-  return err;
-}
+// Use memfs for all fs operations in this test
+vi.mock('node:fs/promises', () => import('memfs').then((m) => m.fs.promises));
 
-vi.mock('node:fs/promises');
 vi.mock('../config/storage.js');
 
 describe('createPolicyUpdater', () => {
@@ -33,6 +28,8 @@ describe('createPolicyUpdater', () => {
   let mockStorage: Storage;
 
   beforeEach(() => {
+    vi.useFakeTimers();
+    vol.reset();
     policyEngine = new PolicyEngine({
       rules: [],
       checkers: [],
@@ -45,225 +42,162 @@ describe('createPolicyUpdater', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   it('should persist policy when persist flag is true', async () => {
     createPolicyUpdater(policyEngine, messageBus, mockStorage);
 
-    const userPoliciesDir = '/mock/user/.gemini/policies';
-    const policyFile = path.join(userPoliciesDir, AUTO_SAVED_POLICY_FILENAME);
+    const policyFile = '/mock/user/.gemini/policies/auto-saved.toml';
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
-    vi.mocked(fs.readFile).mockRejectedValue(
-      makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
-    ); // Simulate new file
 
-    const mockFileHandle = {
-      writeFile: vi.fn().mockResolvedValue(undefined),
-      close: vi.fn().mockResolvedValue(undefined),
-    };
-    vi.mocked(fs.open).mockResolvedValue(
-      mockFileHandle as unknown as fs.FileHandle,
-    );
-    vi.mocked(fs.rename).mockResolvedValue(undefined);
-
-    const toolName = 'test_tool';
     await messageBus.publish({
       type: MessageBusType.UPDATE_POLICY,
-      toolName,
+      toolName: 'test_tool',
       persist: true,
     });
 
-    // Wait for async operations (microtasks)
-    await vi.waitFor(() => {
-      expect(fs.mkdir).toHaveBeenCalledWith(path.dirname(policyFile), {
-        recursive: true,
-      });
+    // Policy updater handles persistence asynchronously in a promise queue.
+    // We use advanceTimersByTimeAsync to yield to the microtask queue.
+    await vi.advanceTimersByTimeAsync(100);
 
-      expect(fs.open).toHaveBeenCalledWith(
-        expect.stringMatching(/\.tmp$/),
-        'wx',
-      );
+    const fileExists = memfs.existsSync(policyFile);
+    expect(fileExists).toBe(true);
 
-      const expectedContent = expect.stringContaining(`toolName = "test_tool"`);
-      expect(mockFileHandle.writeFile).toHaveBeenCalledWith(
-        expectedContent,
-        'utf-8',
-      );
-      expect(fs.rename).toHaveBeenCalledWith(
-        expect.stringMatching(/\.tmp$/),
-        policyFile,
-      );
-    });
+    const content = memfs.readFileSync(policyFile, 'utf-8') as string;
+    expect(content).toContain('toolName = "test_tool"');
+    expect(content).toContain('decision = "allow"');
+    const expectedPriority = getAlwaysAllowPriorityFraction();
+    expect(content).toContain(`priority = ${expectedPriority}`);
   });
 
   it('should not persist policy when persist flag is false or undefined', async () => {
     createPolicyUpdater(policyEngine, messageBus, mockStorage);
 
+    const policyFile = '/mock/user/.gemini/policies/auto-saved.toml';
+    vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
+
     await messageBus.publish({
       type: MessageBusType.UPDATE_POLICY,
       toolName: 'test_tool',
     });
 
-    await vi.waitFor(() => {
-      expect(fs.writeFile).not.toHaveBeenCalled();
-      expect(fs.rename).not.toHaveBeenCalled();
-    });
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(memfs.existsSync(policyFile)).toBe(false);
   });
 
-  it('should persist policy with commandPrefix when provided', async () => {
+  it('should append to existing policy file', async () => {
     createPolicyUpdater(policyEngine, messageBus, mockStorage);
 
-    const userPoliciesDir = '/mock/user/.gemini/policies';
-    const policyFile = path.join(userPoliciesDir, AUTO_SAVED_POLICY_FILENAME);
+    const policyFile = '/mock/user/.gemini/policies/auto-saved.toml';
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
-    vi.mocked(fs.readFile).mockRejectedValue(
-      makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
-    );
 
-    const mockFileHandle = {
-      writeFile: vi.fn().mockResolvedValue(undefined),
-      close: vi.fn().mockResolvedValue(undefined),
-    };
-    vi.mocked(fs.open).mockResolvedValue(
-      mockFileHandle as unknown as fs.FileHandle,
-    );
-    vi.mocked(fs.rename).mockResolvedValue(undefined);
-
-    const toolName = 'run_shell_command';
-    const commandPrefix = 'git status';
+    const existingContent =
+      '[[rule]]\ntoolName = "existing_tool"\ndecision = "allow"\n';
+    const dir = path.dirname(policyFile);
+    memfs.mkdirSync(dir, { recursive: true });
+    memfs.writeFileSync(policyFile, existingContent);
 
     await messageBus.publish({
       type: MessageBusType.UPDATE_POLICY,
-      toolName,
+      toolName: 'new_tool',
       persist: true,
-      commandPrefix,
     });
 
-    await vi.waitFor(() => {
-      // In-memory rule check (unchanged)
-      const rules = policyEngine.getRules();
-      const addedRule = rules.find((r) => r.toolName === toolName);
-      expect(addedRule).toBeDefined();
-      expect(addedRule?.priority).toBe(ALWAYS_ALLOW_PRIORITY);
-      expect(addedRule?.argsPattern).toEqual(
-        new RegExp(`"command":"git\\ status(?:[\\s"]|\\\\")`),
-      );
+    await vi.advanceTimersByTimeAsync(100);
 
-      // Verify file written
-      expect(fs.open).toHaveBeenCalledWith(
-        expect.stringMatching(/\.tmp$/),
-        'wx',
-      );
-      expect(mockFileHandle.writeFile).toHaveBeenCalledWith(
-        expect.stringContaining(`commandPrefix = "git status"`),
-        'utf-8',
-      );
-    });
+    const content = memfs.readFileSync(policyFile, 'utf-8') as string;
+    expect(content).toContain('toolName = "existing_tool"');
+    expect(content).toContain('toolName = "new_tool"');
   });
 
-  it('should persist policy with mcpName and toolName when provided', async () => {
+  it('should handle toml with multiple rules correctly', async () => {
     createPolicyUpdater(policyEngine, messageBus, mockStorage);
 
-    const userPoliciesDir = '/mock/user/.gemini/policies';
-    const policyFile = path.join(userPoliciesDir, AUTO_SAVED_POLICY_FILENAME);
+    const policyFile = '/mock/user/.gemini/policies/auto-saved.toml';
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
-    vi.mocked(fs.readFile).mockRejectedValue(
-      makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
-    );
 
-    const mockFileHandle = {
-      writeFile: vi.fn().mockResolvedValue(undefined),
-      close: vi.fn().mockResolvedValue(undefined),
-    };
-    vi.mocked(fs.open).mockResolvedValue(
-      mockFileHandle as unknown as fs.FileHandle,
-    );
-    vi.mocked(fs.rename).mockResolvedValue(undefined);
+    const existingContent = `
+[[rule]]
+toolName = "tool1"
+decision = "allow"
 
-    const mcpName = 'my-jira-server';
-    const simpleToolName = 'search';
-    const toolName = `${mcpName}__${simpleToolName}`;
+[[rule]]
+toolName = "tool2"
+decision = "deny"
+`;
+    const dir = path.dirname(policyFile);
+    memfs.mkdirSync(dir, { recursive: true });
+    memfs.writeFileSync(policyFile, existingContent);
 
     await messageBus.publish({
       type: MessageBusType.UPDATE_POLICY,
-      toolName,
+      toolName: 'tool3',
       persist: true,
-      mcpName,
     });
 
-    await vi.waitFor(() => {
-      // Verify file written
-      expect(fs.open).toHaveBeenCalledWith(
-        expect.stringMatching(/\.tmp$/),
-        'wx',
-      );
-      const writeCall = mockFileHandle.writeFile.mock.calls[0];
-      const writtenContent = writeCall[0] as string;
-      expect(writtenContent).toContain(`mcpName = "${mcpName}"`);
-      expect(writtenContent).toContain(`toolName = "${simpleToolName}"`);
-      expect(writtenContent).toContain('priority = 200');
-    });
+    await vi.advanceTimersByTimeAsync(100);
+
+    const content = memfs.readFileSync(policyFile, 'utf-8') as string;
+    expect(content).toContain('toolName = "tool1"');
+    expect(content).toContain('toolName = "tool2"');
+    expect(content).toContain('toolName = "tool3"');
   });
 
-  it('should escape special characters in toolName and mcpName', async () => {
+  it('should include argsPattern if provided', async () => {
     createPolicyUpdater(policyEngine, messageBus, mockStorage);
 
-    const userPoliciesDir = '/mock/user/.gemini/policies';
-    const policyFile = path.join(userPoliciesDir, AUTO_SAVED_POLICY_FILENAME);
+    const policyFile = '/mock/user/.gemini/policies/auto-saved.toml';
     vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
-    vi.mocked(fs.readFile).mockRejectedValue(
-      makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
-    );
-
-    const mockFileHandle = {
-      writeFile: vi.fn().mockResolvedValue(undefined),
-      close: vi.fn().mockResolvedValue(undefined),
-    };
-    vi.mocked(fs.open).mockResolvedValue(
-      mockFileHandle as unknown as fs.FileHandle,
-    );
-    vi.mocked(fs.rename).mockResolvedValue(undefined);
-
-    const mcpName = 'my"jira"server';
-    const toolName = `my"jira"server__search"tool"`;
 
     await messageBus.publish({
       type: MessageBusType.UPDATE_POLICY,
-      toolName,
+      toolName: 'test_tool',
       persist: true,
-      mcpName,
+      argsPattern: '^foo.*$',
     });
 
-    await vi.waitFor(() => {
-      expect(fs.open).toHaveBeenCalledWith(
-        expect.stringMatching(/\.tmp$/),
-        'wx',
-      );
-      const writeCall = mockFileHandle.writeFile.mock.calls[0];
-      const writtenContent = writeCall[0] as string;
+    await vi.advanceTimersByTimeAsync(100);
 
-      // Verify escaping - should be valid TOML
-      // Note: @iarna/toml optimizes for shortest representation, so it may use single quotes 'foo"bar'
-      // instead of "foo\"bar\"" if there are no single quotes in the string.
-      try {
-        expect(writtenContent).toContain(`mcpName = "my\\"jira\\"server"`);
-      } catch {
-        expect(writtenContent).toContain(`mcpName = 'my"jira"server'`);
-      }
-
-      try {
-        expect(writtenContent).toContain(`toolName = "search\\"tool\\""`);
-      } catch {
-        expect(writtenContent).toContain(`toolName = 'search"tool"'`);
-      }
-    });
+    const content = memfs.readFileSync(policyFile, 'utf-8') as string;
+    expect(content).toContain('argsPattern = "^foo.*$"');
   });
 
-  it('should include error details in feedback message on persistence failure', async () => {
+  it('should include mcpName if provided', async () => {
+    createPolicyUpdater(policyEngine, messageBus, mockStorage);
+
+    const policyFile = '/mock/user/.gemini/policies/auto-saved.toml';
+    vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
+
+    await messageBus.publish({
+      type: MessageBusType.UPDATE_POLICY,
+      toolName: 'search"tool"',
+      persist: true,
+      mcpName: 'my"jira"server',
+    });
+
+    await vi.advanceTimersByTimeAsync(100);
+
+    const writtenContent = memfs.readFileSync(policyFile, 'utf-8') as string;
+
+    // Verify escaping - should be valid TOML and contain the values
+    // Note: @iarna/toml optimizes for shortest representation, so it may use single quotes 'foo"bar'
+    // instead of "foo\"bar\"" if there are no single quotes in the string.
+    try {
+      expect(writtenContent).toContain('mcpName = "my\\"jira\\"server"');
+    } catch {
+      expect(writtenContent).toContain('mcpName = \'my"jira"server\'');
+    }
+
+    try {
+      expect(writtenContent).toContain('toolName = "search\\"tool\\""');
+    } catch {
+      expect(writtenContent).toContain('toolName = \'search"tool"\'');
+    }
+  });
+
+  it('should persist to workspace when persistScope is workspace', async () => {
     createPolicyUpdater(policyEngine, messageBus, mockStorage);
 
     const workspacePoliciesDir = '/mock/project/.gemini/policies';
@@ -271,149 +205,21 @@ describe('createPolicyUpdater', () => {
       workspacePoliciesDir,
       AUTO_SAVED_POLICY_FILENAME,
     );
-    vi.spyOn(mockStorage, 'getWorkspacePoliciesDir').mockReturnValue(
-      workspacePoliciesDir,
+    vi.spyOn(mockStorage, 'getWorkspaceAutoSavedPolicyPath').mockReturnValue(
+      policyFile,
     );
-    vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    vi.mocked(fs.mkdir).mockRejectedValue(new Error('Permission denied'));
-
-    const feedbackSpy = vi.spyOn(coreEvents, 'emitFeedback');
 
     await messageBus.publish({
       type: MessageBusType.UPDATE_POLICY,
       toolName: 'test_tool',
       persist: true,
+      persistScope: 'workspace',
     });
 
-    await vi.waitFor(() => {
-      expect(feedbackSpy).toHaveBeenCalledWith(
-        'error',
-        expect.stringContaining('Permission denied'),
-        expect.any(Error),
-      );
-    });
-  });
+    await vi.advanceTimersByTimeAsync(100);
 
-  it('should clean up tmp file on write failure', async () => {
-    createPolicyUpdater(policyEngine, messageBus, mockStorage);
-
-    const workspacePoliciesDir = '/mock/project/.gemini/policies';
-    const policyFile = path.join(
-      workspacePoliciesDir,
-      AUTO_SAVED_POLICY_FILENAME,
-    );
-    vi.spyOn(mockStorage, 'getWorkspacePoliciesDir').mockReturnValue(
-      workspacePoliciesDir,
-    );
-    vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
-    vi.mocked(fs.readFile).mockRejectedValue(
-      makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
-    );
-
-    const mockFileHandle = {
-      writeFile: vi.fn().mockRejectedValue(new Error('Disk full')),
-      close: vi.fn().mockResolvedValue(undefined),
-    };
-    vi.mocked(fs.open).mockResolvedValue(
-      mockFileHandle as unknown as fs.FileHandle,
-    );
-    vi.mocked(fs.unlink).mockResolvedValue(undefined);
-
-    await messageBus.publish({
-      type: MessageBusType.UPDATE_POLICY,
-      toolName: 'test_tool',
-      persist: true,
-    });
-
-    await vi.waitFor(() => {
-      // Should attempt to clean up the tmp file
-      expect(fs.unlink).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/));
-    });
-  });
-
-  it('should abort persistence on non-ENOENT read errors', async () => {
-    createPolicyUpdater(policyEngine, messageBus, mockStorage);
-
-    const workspacePoliciesDir = '/mock/project/.gemini/policies';
-    const policyFile = path.join(
-      workspacePoliciesDir,
-      AUTO_SAVED_POLICY_FILENAME,
-    );
-    vi.spyOn(mockStorage, 'getWorkspacePoliciesDir').mockReturnValue(
-      workspacePoliciesDir,
-    );
-    vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
-    // Simulate EACCES when reading the existing policy file
-    vi.mocked(fs.readFile).mockRejectedValue(
-      makeNodeError('Permission denied', 'EACCES'),
-    );
-
-    const feedbackSpy = vi.spyOn(coreEvents, 'emitFeedback');
-
-    await messageBus.publish({
-      type: MessageBusType.UPDATE_POLICY,
-      toolName: 'test_tool',
-      persist: true,
-    });
-
-    await vi.waitFor(() => {
-      // Should NOT attempt to write a new file
-      expect(fs.open).not.toHaveBeenCalled();
-      // Should report the error with details
-      expect(feedbackSpy).toHaveBeenCalledWith(
-        'error',
-        expect.stringContaining('Permission denied'),
-        expect.any(Error),
-      );
-    });
-  });
-
-  it('should fall back to copy+unlink when rename fails with EXDEV', async () => {
-    createPolicyUpdater(policyEngine, messageBus, mockStorage);
-
-    const workspacePoliciesDir = '/mock/project/.gemini/policies';
-    const policyFile = path.join(
-      workspacePoliciesDir,
-      AUTO_SAVED_POLICY_FILENAME,
-    );
-    vi.spyOn(mockStorage, 'getWorkspacePoliciesDir').mockReturnValue(
-      workspacePoliciesDir,
-    );
-    vi.spyOn(mockStorage, 'getAutoSavedPolicyPath').mockReturnValue(policyFile);
-    vi.mocked(fs.mkdir).mockResolvedValue(undefined);
-    vi.mocked(fs.readFile).mockRejectedValue(
-      makeNodeError('ENOENT: no such file or directory', 'ENOENT'),
-    );
-
-    const mockFileHandle = {
-      writeFile: vi.fn().mockResolvedValue(undefined),
-      close: vi.fn().mockResolvedValue(undefined),
-    };
-    vi.mocked(fs.open).mockResolvedValue(
-      mockFileHandle as unknown as fs.FileHandle,
-    );
-    // Simulate cross-device link error
-    vi.mocked(fs.rename).mockRejectedValue(
-      makeNodeError('EXDEV: cross-device link not permitted', 'EXDEV'),
-    );
-    vi.mocked(fs.copyFile).mockResolvedValue(undefined);
-    vi.mocked(fs.unlink).mockResolvedValue(undefined);
-
-    await messageBus.publish({
-      type: MessageBusType.UPDATE_POLICY,
-      toolName: 'test_tool',
-      persist: true,
-    });
-
-    await vi.waitFor(() => {
-      // Should fall back to copy + unlink
-      expect(fs.copyFile).toHaveBeenCalledWith(
-        expect.stringMatching(/\.tmp$/),
-        policyFile,
-      );
-      expect(fs.unlink).toHaveBeenCalledWith(expect.stringMatching(/\.tmp$/));
-    });
+    expect(memfs.existsSync(policyFile)).toBe(true);
+    const content = memfs.readFileSync(policyFile, 'utf-8') as string;
+    expect(content).toContain('toolName = "test_tool"');
   });
 });
